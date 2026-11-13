@@ -1,6 +1,6 @@
 # VPS setup (Ubuntu 24.04) for multiple projects
 
-A step-by-step guide: clean VPS → Docker → shared **Traefik** reverse proxy → the **vacancy-grabber** project. First the project is available at `http://<VPS Tailscale IP>`; then it is published at **`https://vacancy-grabber.lucked.me`** through a Cloudflare Tunnel (step 18). Later you can add more projects with their own domains to the same server.
+A step-by-step guide: clean VPS → Docker → shared **Traefik** reverse proxy → the **vacancy-grabber** project. First the project is available at `http://<VPS Tailscale IP>`; then it is published at **`https://vacancy-grabber.lucked.me`** through a Cloudflare Tunnel (step 18). Step 19 adds a second project, **Nextcloud All-in-One** at `https://cloud.lucked.me`. Later you can add more projects with their own domains to the same server.
 
 ## How it works
 
@@ -35,11 +35,16 @@ With the tunnel, Cloudflare terminates HTTPS and redirects `http://` to `https:/
 │   └── dump/                       # archived DB dumps (*.sql.gz), kept 7 days
 ├── infrastructure/                 # Traefik
 │   ├── docker-compose.yaml         # copy of vps-setup repo: docs/infrastructure/docker-compose.yaml
-│   ├── .env                        # ACME_EMAIL
+│   ├── .env                        # ACME_EMAIL, TUNNEL_TOKEN
+│   ├── dynamic/cloud.yaml          # Traefik file-provider route for Nextcloud (step 19)
 │   └── letsencrypt/
 │       └── dad.json                # certificates (chmod 600)
 └── www/
-    └── vacancy-grabber/            # git clone of the project
+    ├── vacancy-grabber/            # git clone of the project
+    └── cloud/                      # Nextcloud All-in-One (step 19)
+        ├── docker-compose.yaml     # copy of docs/cloud/docker-compose.yaml
+        ├── .env                    # NEXTCLOUD_DATADIR, APACHE_IP_BINDING, TAILSCALE_IP
+        └── ncdata/                 # Nextcloud user data
     # later: site1.com/  site2.com/  sub-1.site1.com/ ...
 ```
 
@@ -123,6 +128,8 @@ sudo ufw status verbose
 ```
 
 > The VPS has no public IP and the Cloudflare Tunnel (step 18) is outbound only, so ports 80/443 are not needed by the tunnel and are not reachable from the internet. They stay open as above (tailnet access, or a future public IP).
+
+> For the `cloud` project (step 19) one more rule is added: `sudo ufw allow from 172.16.0.0/12 to any port 11000 proto tcp` (Traefik reaches Nextcloud's Apache through the docker0 gateway). Never open 8080 or 11000 to the world.
 
 > ⚠️ Docker bypasses ufw rules for published ports (`ports:` in compose). That is why **only Traefik** has `ports:`. Projects use `expose:` and the `reverse-proxy` network. MySQL is not published to the outside.
 
@@ -251,7 +258,9 @@ sudo systemctl restart docker
 ```bash
 mkdir -p /home/dad/workspace/backups/dump
 mkdir -p /home/dad/workspace/infrastructure/letsencrypt
+mkdir -p /home/dad/workspace/infrastructure/dynamic
 mkdir -p /home/dad/workspace/www
+mkdir -p /home/dad/workspace/www/cloud/ncdata      # step 19 (Nextcloud AIO)
 
 touch /home/dad/workspace/infrastructure/letsencrypt/dad.json
 chmod 600 /home/dad/workspace/infrastructure/letsencrypt/dad.json
@@ -268,7 +277,7 @@ docker network create reverse-proxy
 ```
 
 Create `docker-compose.yaml` for Traefik. Its content is in the `vps-setup` repo: [`docs/infrastructure/docker-compose.yaml`](infrastructure/docker-compose.yaml). There are two ways to copy it:
-- copy the file from your machine: `scp /home/vitaly/workspace/www/nastiksot-vps/vps-setup/docs/infrastructure/docker-compose.yaml <user>@<tailscale-ip>:/home/dad/workspace/infrastructure/`;
+- copy the file from your machine: `scp /home/vitaly/workspace/www/nastiksot-vps/vps-setup/docs/infrastructure/docker-compose.yaml dad@100.91.57.78:/home/dad/workspace/infrastructure/`;
 - or right away, with `nano /home/dad/workspace/infrastructure/docker-compose.yaml` and pasting the content.
 
 Email for Let's Encrypt:
@@ -556,7 +565,7 @@ The template in the `vps-setup` repo [`docs/infrastructure/docker-compose.yaml`]
 
 ```bash
 # on your machine: copy the template to the server (nothing server-specific in it)
-scp /home/vitaly/workspace/www/nastiksot-vps/vps-setup/docs/infrastructure/docker-compose.yaml <user>@<tailscale-ip>:/home/dad/workspace/infrastructure/docker-compose.yaml
+scp /home/vitaly/workspace/www/nastiksot-vps/vps-setup/docs/infrastructure/docker-compose.yaml dad@100.91.57.78:/home/dad/workspace/infrastructure/docker-compose.yaml
 
 # on the server
 cd /home/dad/workspace/infrastructure
@@ -631,7 +640,159 @@ cd /home/dad/workspace/infrastructure && docker compose stop cloudflared  # the 
 
 No tunnel is needed then. Create a DNS-only A record → the public IP (check with `dig +short vacancy-grabber.lucked.me`), uncomment the "Stage 2" labels (including the `redirectscheme` middleware) in `docker-compose.prod.yaml`, and `make prod-up`; Traefik obtains the Let's Encrypt certificate into `letsencrypt/dad.json`. Remove the tunnel public hostname and the `cloudflared` service so there are not two paths to the same site.
 
-## Step 19. Adding the next project
+## Step 19. Project `cloud`: Nextcloud All-in-One (AIO)
+
+Goal: Nextcloud at **`https://cloud.lucked.me`** (change the name if you want another), with optional Office (Collabora) and built-in backups, in `/home/dad/workspace/www/cloud`. It uses the same Traefik and the same Cloudflare Tunnel as vacancy-grabber. The AIO admin interface is **not** public: it is reachable only over Tailscale.
+
+How AIO differs from a normal compose project:
+- You run **one** container, the *mastercontainer*. It has access to the Docker socket and **creates and updates all the other containers itself** (apache, nextcloud, database, redis, collabora, borgbackup, ...). Do not describe them in your compose file and do not put them in `reverse-proxy`.
+- Behind a reverse proxy AIO's Apache listens on port `11000` and speaks plain HTTP; TLS is done by Cloudflare.
+- The container name `nextcloud-aio-mastercontainer` and the volume `nextcloud_aio_mastercontainer` are fixed by AIO: do not rename them.
+
+```
+Browser ──https──► Cloudflare ──tunnel──► cloudflared ──http──► traefik:80
+                                  Host: cloud.lucked.me │ router from dynamic/cloud.yaml
+                                                        ▼
+                                  host.docker.internal:11000 (= 172.17.0.1, the docker0 gateway)
+                                                        ▼
+                                  nextcloud-aio-apache ─► nextcloud / database / redis / collabora ...
+
+Admin UI (Tailscale only): https://100.91.57.78:8080 ─► nextcloud-aio-mastercontainer
+```
+
+### 19.0 Requirements and limits (read first)
+
+- **RAM:** AIO wants 4 GB or more (8 GB is comfortable); the swap from step 6 must exist. **Disk:** user data lives in `ncdata/`; check `df -h /home`.
+- **Cloudflare limits request bodies to 100 MB** (free and Pro plans). Larger files cannot be uploaded in the browser through `cloud.lucked.me`. The desktop and mobile clients upload in chunks and are not affected.
+- Cloudflare's terms discourage serving large media through the proxy: fine for documents and photos, not for a video streaming service.
+- **Nextcloud Talk** needs port `3478` (TURN), which cannot pass a Cloudflare tunnel: leave Talk off (19.5) or use it only inside the tailnet.
+- Docker Engine from step 8 is enough. Do not use the snap Docker.
+
+### 19.1 Prepare Traefik for the host route (server)
+
+The Traefik template in the repo already has what is needed: the file provider (`--providers.file.directory=/dynamic`), `extra_hosts: host.docker.internal:host-gateway`, the `./dynamic:/dynamic:ro` volume and `readTimeout=0` (so long uploads are not cut). The route itself is in [`docs/infrastructure/dynamic/cloud.yaml`](infrastructure/dynamic/cloud.yaml).
+
+```bash
+# on your machine
+scp /home/vitaly/workspace/www/nastiksot-vps/vps-setup/docs/infrastructure/docker-compose.yaml dad@100.91.57.78:/home/dad/workspace/infrastructure/docker-compose.yaml
+scp /home/vitaly/workspace/www/nastiksot-vps/vps-setup/docs/infrastructure/dynamic/cloud.yaml dad@100.91.57.78:/home/dad/workspace/infrastructure/dynamic/cloud.yaml
+
+# on the server (if you changed the domain, edit it in dynamic/cloud.yaml first)
+cd /home/dad/workspace/infrastructure
+mkdir -p dynamic
+docker compose up -d                       # recreates traefik with the new flags
+docker compose logs traefik | tail         # no error lines
+sudo ufw allow from 172.16.0.0/12 to any port 11000 proto tcp
+```
+
+The `ufw` rule is needed because Traefik reaches AIO through the docker0 gateway: that is host-local traffic, which `ufw` does filter (unlike published ports). Never open `8080` or `11000` to the world.
+
+There is no `redirectscheme` middleware here (it would loop behind the tunnel); the `trustedips` flag from step 18.3 is what makes `X-Forwarded-Proto: https` reach Nextcloud.
+
+### 19.2 Cloudflare: add the public hostname (browser)
+
+Zero Trust → Networks → Tunnels → `vps` → **Published application routes** → **Add**: Subdomain `cloud`, Domain `lucked.me`, Type `HTTP`, URL `traefik:80`. Save. Cloudflare creates the proxied CNAME `cloud` → `<tunnel-id>.cfargotunnel.com` itself (see 18.1; delete an existing DNS record with that name first). The HTTPS-only settings from 18.2 apply to the whole zone, nothing more to do. Keep HSTS off in Cloudflare: Nextcloud sends its own header.
+
+### 19.3 Files on the server
+
+```bash
+mkdir -p /home/dad/workspace/www/cloud/ncdata
+cd /home/dad/workspace/www/cloud
+```
+
+Copy the templates from the repo ([`docs/cloud/docker-compose.yaml`](cloud/docker-compose.yaml), [`docs/cloud/.env.dist`](cloud/.env.dist)):
+
+```bash
+# on your machine
+scp /home/vitaly/workspace/www/nastiksot-vps/vps-setup/docs/cloud/docker-compose.yaml dad@100.91.57.78:/home/dad/workspace/www/cloud/
+scp /home/vitaly/workspace/www/nastiksot-vps/vps-setup/docs/cloud/.env.dist dad@100.91.57.78:/home/dad/workspace/www/cloud/
+
+# on the server
+cd /home/dad/workspace/www/cloud
+cp .env.dist .env
+chmod 600 .env
+ip -4 addr show docker0                    # check the address; normally 172.17.0.1
+nano .env                                  # TAILSCALE_IP, APACHE_IP_BINDING, NEXTCLOUD_DATADIR
+```
+
+Notes:
+- `"${TAILSCALE_IP}:8080:8080"` publishes the admin UI only on the Tailscale address, so it is not reachable from the LAN or the internet, even if the VPS gets a public IP later. The UI uses a self-signed certificate: the browser warning is expected.
+- `NEXTCLOUD_DATADIR` must be an existing absolute path **before the first start**; it cannot be changed later without reinstalling, and it must not be on a network drive. AIO sets the owner itself.
+- `APACHE_IP_BINDING` must be the `docker0` address (`172.17.0.1` by default). Traefik's `host-gateway` resolves to the same address.
+- Do **not** add `80:80` or `8443:8443`: those are only for AIO without a reverse proxy.
+- `image: ...:latest` is what AIO recommends (it updates itself through its UI). Pin a tag only if you update by hand.
+
+### 19.4 First start
+
+```bash
+cd /home/dad/workspace/www/cloud
+docker compose up -d
+docker compose ps                                       # nextcloud-aio-mastercontainer Up (healthy)
+docker compose logs -f nextcloud-aio-mastercontainer    # wait until it is ready, Ctrl+C
+```
+
+### 19.5 Initial setup in the AIO interface (browser on a device in the tailnet)
+
+1. Open `https://100.91.57.78:8080` (accept the certificate warning). The page shows a **passphrase** (8 words): **save it in a password manager now**. It is the only way into the admin UI. If it is lost: `docker exec nextcloud-aio-mastercontainer grep password /mnt/docker-aio-config/data/configuration.json`.
+2. Log in with the passphrase. Under "New AIO instance" enter `cloud.lucked.me` and press **Submit domain**.
+   - AIO checks the domain by requesting it from the VPS (through Cloudflare and the tunnel back to its own Apache). If it fails ("Domain does not point to this server"), set `SKIP_DOMAIN_VALIDATION: "true"` in `docker-compose.yaml`, run `docker compose up -d` and submit again. The check only protects against a mistyped domain; with a tunnel the DNS record is managed by Cloudflare.
+3. Choose the optional containers. Recommended for a small VPS: **Nextcloud Office (Collabora)** only if there is RAM (about +1.5 GB); **ClamAV off**; **Fulltextsearch off**; **Imaginary on** (faster previews); **Talk off** (19.0).
+4. Set the timezone (the one from step 1) and press **Download and start containers**. About 15 images are pulled; the first start takes 5-15 minutes. Wait until all containers are green and the **Open your Nextcloud** button appears. The page also shows the initial `admin` **password**: save it.
+5. From outside the tailnet (a phone on mobile data) open `https://cloud.lucked.me`, log in as `admin`, change the password and create your own user.
+
+### 19.6 After the installation
+
+- Administration settings → **Overview**: go through the warnings. With a correct `trustedips` there should be none about HTTPS or reverse proxy headers.
+- Trust Traefik as a proxy and check the settings:
+  ```bash
+  docker exec --user www-data nextcloud-aio-nextcloud php occ config:system:set trusted_proxies 10 --value="172.16.0.0/12"
+  docker exec --user www-data nextcloud-aio-nextcloud php occ config:system:get overwriteprotocol   # https
+  ```
+  The client IP in Nextcloud's log should be the real one, not `172.x` (brute-force protection depends on it).
+- Phone region: `docker exec --user www-data nextcloud-aio-nextcloud php occ config:system:set default_phone_region --value="UA"` (your country code).
+- Email: Administration → Basic settings → Email server (AIO has no mail server of its own).
+- Clients: install the desktop and mobile apps with the server `https://cloud.lucked.me`.
+- Optional: a Cloudflare WAF rate-limit rule for `/login` (like 18.7).
+
+### 19.7 Backups (built-in Borg backup, separate from step 17)
+
+1. On the server: `mkdir -p /home/dad/workspace/backups/nextcloud-aio` (not inside `ncdata/`).
+2. AIO UI → **Backup and restore** → location `/home/dad/workspace/backups/nextcloud-aio` → **Create backup**. AIO shows a **backup encryption password**: save it in the password manager. Without it a restore is impossible.
+3. Enable the **daily backup** (for example 04:00) in the same section. During the backup AIO stops the containers, checks the archive and starts them again; with "automatic updates" ticked it updates the containers at that time too.
+4. A backup on the same disk is not a backup: copy `/home/dad/workspace/backups/nextcloud-aio` to another machine or storage (`rsync`/`rclone`). The AIO backup includes the data directory.
+5. Test a restore once: AIO UI → Backup and restore → choose the backup → **Restore**. It also works after a reinstall: mount the same directory and enter the password.
+
+### 19.8 Updates
+
+- Containers (including Nextcloud major versions): AIO UI → **Update containers** (shown when new images exist), or the daily automatic updates from 19.7.
+- The mastercontainer itself: `cd /home/dad/workspace/www/cloud && docker compose pull && docker compose up -d`. The UI shows a notice when it is outdated.
+- Cleanup: `docker image prune -f`.
+
+### 19.9 Verify
+
+```bash
+docker ps --format '{{.Names}}\t{{.Status}}' | grep nextcloud               # all Up (healthy)
+curl -s -o /dev/null -w '%{http_code}\n' http://172.17.0.1:11000/            # 200/302 from the host
+curl -sI https://cloud.lucked.me/status.php | head -5                        # 200 (from a machine outside the tailnet)
+curl -sI http://cloud.lucked.me/ | head -3                                   # 301 to https (Cloudflare)
+```
+
+`https://<LAN-or-public-address>:8080` must not answer: the admin UI listens only on the Tailscale IP. In the browser: log in, upload a 5 MB file, open it in Collabora (if enabled), create a share link and open it in a private window.
+
+### 19.10 Rollback / removal
+
+- Take the site offline only: delete the `cloud` route of the tunnel (Zero Trust → Tunnels → `vps`), or remove `dynamic/cloud.yaml` on the server.
+- Stop AIO: AIO UI → **Stop containers**, then `docker compose down` in `www/cloud`. The data stays in `ncdata/` and in the volumes.
+- Full removal (**destroys the data**; make a backup first): stop the containers in the UI, then
+  ```bash
+  cd /home/dad/workspace/www/cloud && docker compose down -v
+  docker rm -f $(docker ps -aq --filter name=nextcloud-aio)
+  docker volume rm $(docker volume ls -q --filter name=nextcloud_aio)
+  docker network rm nextcloud-aio
+  sudo rm -rf /home/dad/workspace/www/cloud/ncdata
+  ```
+
+## Step 20. Adding the next project
 
 Example: `site1.com` in the folder `/home/dad/workspace/www/site1.com`.
 
@@ -680,7 +841,7 @@ Rules for every new project:
 - **Tunnelled domains:** each new domain is one more **public hostname** on the same Cloudflare tunnel (service `HTTP`, URL `traefik:80`) plus the usual Traefik router labels: no certificate labels and no redirect middleware (Cloudflare redirects).
 - Before starting, check that the domain's DNS already points to the server. Otherwise Let's Encrypt will not issue a certificate, and after several failed attempts it temporarily blocks requests.
 
-## Step 20. Cheat sheet and troubleshooting
+## Step 21. Cheat sheet and troubleshooting
 
 ```bash
 # Traefik
@@ -693,6 +854,11 @@ make prod-ps
 make prod-logs
 make prod-console
 make prod-down
+
+# Nextcloud AIO
+cd /home/dad/workspace/www/cloud && docker compose ps
+docker logs nextcloud-aio-mastercontainer      # also: nextcloud-aio-apache, nextcloud-aio-nextcloud
+docker exec --user www-data -it nextcloud-aio-nextcloud php occ status
 
 # resources
 docker stats
@@ -709,6 +875,12 @@ df -h && docker system df
 | Endless redirect to https | A Traefik `redirectscheme` middleware is enabled on the router; remove it (Cloudflare does the redirect, step 18). |
 | Everybody throttled as one IP, `http://` links in pages | `--entrypoints.web.forwardedheaders.trustedips` is missing in Traefik (step 18.3). |
 | `http://` does not redirect to https | "Always Use HTTPS" is off in Cloudflare (step 18.2). |
+| Nextcloud: "Access through untrusted domain" | The domain is missing in `trusted_domains`: `docker exec --user www-data nextcloud-aio-nextcloud php occ config:system:set trusted_domains 1 --value=cloud.lucked.me`. |
+| Nextcloud: 502/504 from Traefik | AIO is stopped, `APACHE_IP_BINDING` is not the docker0 address, or `ufw` blocks port 11000 (19.1, 19.3). |
+| Nextcloud: "Domain does not point to this server" in the AIO UI | Set `SKIP_DOMAIN_VALIDATION: "true"` (19.5). |
+| Nextcloud: a big upload fails in the browser at 100 MB | Cloudflare body limit; use the sync client (19.0). |
+| Nextcloud warns about reverse proxy headers / wrong client IPs | `trusted_proxies` (19.6) and `trustedips` in Traefik (18.3). |
+| AIO passphrase lost | `docker exec nextcloud-aio-mastercontainer grep password /mnt/docker-aio-config/data/configuration.json`. |
 | Certificate is not issued (variant B only) | DNS does not point to the VPS yet, or port 80 is closed. `dad.json` must have permissions `600`. See `docker logs traefik`. |
 | Build fails: `Killed` / exit 137 | Not enough memory, add swap (step 6). |
 | Site without styles | The nginx image was built from old code: `make prod-up` (with `--build`). |

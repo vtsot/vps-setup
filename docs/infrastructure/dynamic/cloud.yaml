@@ -1,0 +1,19 @@
+# Traefik file-provider route for Nextcloud All-in-One (docs/vps-setup.md, step 19).
+# Location on the server: /home/dad/workspace/infrastructure/dynamic/cloud.yaml
+#
+# AIO creates its own containers, so there are no docker labels: Traefik forwards the domain to
+# the port that AIO's Apache publishes on the docker0 gateway (APACHE_IP_BINDING in www/cloud).
+# host.docker.internal comes from "extra_hosts: host-gateway" of the traefik service.
+# No redirectscheme middleware: Cloudflare does http -> https (it would loop behind the tunnel).
+http:
+  routers:
+    cloud:
+      rule: Host(`cloud.lucked.me`)
+      entryPoints:
+        - web
+      service: cloud
+  services:
+    cloud:
+      loadBalancer:
+        servers:
+          - url: "http://host.docker.internal:11000"

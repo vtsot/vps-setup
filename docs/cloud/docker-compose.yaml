@@ -1,0 +1,37 @@
+# Nextcloud All-in-One (AIO) mastercontainer, behind Traefik + Cloudflare Tunnel.
+# Location on the server: /home/dad/workspace/www/cloud/docker-compose.yaml
+#
+#   cd /home/dad/workspace/www/cloud && cp .env.dist .env && docker compose up -d
+#
+# Only this container is described here. AIO creates and updates all the other containers
+# (apache, nextcloud, database, redis, collabora, borgbackup ...) itself through the docker socket.
+# They are NOT on the "reverse-proxy" network: Traefik reaches AIO's Apache on the docker0 gateway
+# (see docs/infrastructure/dynamic/cloud.yaml). Setup steps: docs/vps-setup.md, step 19.
+
+name: cloud
+
+services:
+    nextcloud-aio-mastercontainer:
+        image: ghcr.io/nextcloud-releases/all-in-one:latest   # AIO updates itself through its UI; pin a tag only if you update by hand
+        init: true
+        restart: always
+        container_name: nextcloud-aio-mastercontainer         # fixed by AIO, do not rename
+        volumes:
+            - nextcloud_aio_mastercontainer:/mnt/docker-aio-config   # fixed by AIO, do not rename
+            - /var/run/docker.sock:/var/run/docker.sock:ro
+        ports:
+            # AIO admin UI (self-signed https), Tailscale IP only. Never 0.0.0.0.
+            - "${TAILSCALE_IP:?set TAILSCALE_IP in .env}:8080:8080"
+            # No 80:80 / 8443:8443: those are for AIO without a reverse proxy.
+        environment:
+            APACHE_PORT: 11000                                 # Apache speaks plain HTTP behind the proxy
+            APACHE_IP_BINDING: ${APACHE_IP_BINDING:-172.17.0.1}
+            NEXTCLOUD_DATADIR: ${NEXTCLOUD_DATADIR:?set NEXTCLOUD_DATADIR in .env}
+            NEXTCLOUD_MEMORY_LIMIT: 2048M
+            NEXTCLOUD_UPLOAD_LIMIT: 16G                        # Cloudflare still caps browser uploads at 100 MB
+            NEXTCLOUD_MAX_TIME: 3600
+            SKIP_DOMAIN_VALIDATION: "false"                    # "true" only if the domain check in the AIO UI fails
+
+volumes:
+    nextcloud_aio_mastercontainer:
+        name: nextcloud_aio_mastercontainer                    # fixed by AIO, do not rename

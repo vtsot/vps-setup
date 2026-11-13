@@ -32,6 +32,11 @@ services:
             - --certificatesresolvers.le.acme.httpchallenge.entrypoint=web
             - --api.dashboard=true
             - --api.insecure=true
+            # file provider: routes to services that are not docker labels (e.g. Nextcloud AIO on the host, step 19)
+            - --providers.file.directory=/dynamic
+            - --providers.file.watch=true
+            # do not cut long uploads (default read timeout is 60 s)
+            - --entrypoints.web.transport.respondingTimeouts.readTimeout=0
             - --log.level=INFO
             - --accesslog=true
         ports:
@@ -43,6 +48,10 @@ services:
         volumes:
             - /var/run/docker.sock:/var/run/docker.sock:ro
             - ./letsencrypt:/letsencrypt
+            - ./dynamic:/dynamic:ro
+        # lets Traefik reach ports published on the host (docker0 gateway), see dynamic/cloud.yaml
+        extra_hosts:
+            - "host.docker.internal:host-gateway"
         networks:
             - reverse-proxy
 
